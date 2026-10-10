@@ -1,0 +1,10 @@
+# build artifacts
+kerr
+*.o
+
+# render intermediates (raw frames + stills are huge and regenerable)
+*.ppm
+frames/
+
+# python/editor cruft
+__pycache__/
