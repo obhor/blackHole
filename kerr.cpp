@@ -2,6 +2,10 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <vector>
+#include <string>
+#include <cstdio>
+#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -17,19 +21,26 @@ int spaceWidth = 0, spaceHeight = 0, spaceChannels = 0;
 // Settings
 double camR = 30.0;
 double tilt = 0.05;  // Very small tilt - almost edge-on view (Interstellar!)
+double tiltAmp = 0.5;  // orbit swoop: elevation rises and falls once per lap (0 = flat edge-on orbit)
 double zoom = 1.0;
 double a = 0.6;
-double discMin = 3.83;
+double discMin = 3.83;  // ISCO
 double discMax = 15.0;
+double discHeight = 0.03;  // THIN disk for Interstellar-like razor edge (was 0.15)
 double eps = 0.01;
 double dtau = 0.1;
 int maxSteps = 500;
+
+// Motion blur / time integration
+int TIME_SAMPLES = 4;  // still: 4 (motion blur). orbit video: set to 1 — blur comes free from frame-to-frame motion, and it's 4x faster
+constexpr double DISK_ROTATION_SPEED = 0.3;  // Angular velocity for motion blur
 
 struct Vec3 {
     double x, y, z;
     Vec3 operator+(const Vec3& b) const { return {x+b.x, y+b.y, z+b.z}; }
     Vec3 operator-(const Vec3& b) const { return {x-b.x, y-b.y, z-b.z}; }
     Vec3 operator*(double s) const { return {x*s, y*s, z*s}; }
+    Vec3& operator+=(const Vec3& b) { x+=b.x; y+=b.y; z+=b.z; return *this; }
 };
 
 struct Vec4 {
@@ -65,6 +76,13 @@ double length(const Vec3& v) {
 Vec3 normalize(const Vec3& v) {
     double len = length(v);
     return v * (1.0 / len);
+}
+
+// Rotate a vector about the spin axis (z). At ang=0 this is an exact identity
+// (cos=1, sin=0), so a still render stays bit-identical to before orbiting existed.
+Vec3 rotZ(const Vec3& p, double ang) {
+    double c = std::cos(ang), s = std::sin(ang);
+    return {p.x*c - p.y*s, p.x*s + p.y*c, p.z};
 }
 
 Mat4 diag(const Vec4& v) {
@@ -210,88 +228,171 @@ Vec3 skyTexture(const Vec3& dir) {
     };
 }
 
-// Procedural disk texture
-Vec3 discTexture(double u, double v) {
-    double r = std::sqrt((u-0.5)*(u-0.5) + (v-0.5)*(v-0.5)) * 2.0;
-    double angle = std::atan2(v-0.5, u-0.5);
-    int spirals = int(std::floor(angle * 3.0 / PI + r * 10.0)) & 1;
-    Vec3 color = spirals ? Vec3{1.0, 0.6, 0.2} : Vec3{0.8, 0.4, 0.1};
-    return color * (1.0 - r * 0.5);
+// Planck spectrum -> sRGB hue (Tanner Helland approximation), T in Kelvin.
+Vec3 blackbodyRGB(double T) {
+    T = std::fmax(1000.0, std::fmin(40000.0, T)) / 100.0;
+    double r, g, b;
+    r = (T <= 66.0) ? 255.0 : 329.698727446 * std::pow(T - 60.0, -0.1332047592);
+    g = (T <= 66.0) ? 99.4708025861 * std::log(T) - 161.1195681661
+                    : 288.1221695283 * std::pow(T - 60.0, -0.0755148492);
+    if (T >= 66.0)      b = 255.0;
+    else if (T <= 19.0) b = 0.0;
+    else                b = 138.5177312231 * std::log(T - 10.0) - 305.0447927307;
+    auto cl = [](double v){ return std::fmax(0.0, std::fmin(255.0, v)) / 255.0; };
+    return {cl(r), cl(g), cl(b)};
+}
+
+// Optically thin accretion disk emission model
+// Returns emitted light contribution (additive, not opaque)
+Vec3 diskEmission(const Vec4& pos, const Vec4& p, double timeOffset) {
+    double r = rFromCoords(pos);
+    
+    // Check if in disk radial bounds
+    if (r < discMin || r > discMax) return {0, 0, 0};
+    
+    // Check if within disk height (THICK for visibility)
+    double diskH = discHeight * r;
+    if (std::abs(pos.z) > diskH) return {0, 0, 0};
+    
+    // Temperature falloff: hotter near ISCO, cooler at outer edge
+    double temp = std::pow((discMax - r) / (discMax - discMin), 1.5);
+    
+    // Azimuthal angle (with rotation for motion blur)
+    double phi = std::atan2(pos.y, pos.x) + timeOffset * DISK_ROTATION_SPEED / std::sqrt(r);
+    
+    // Azimuthal density modulation - SOFTENED (less banding)
+    double spiralPattern = 0.8 + 0.2 * std::sin(phi * 5.0 + r * 2.0);  // Softer spirals
+    double ringPattern = 0.9 + 0.1 * std::sin(r * 15.0);  // Softer rings
+    double density = spiralPattern * ringPattern;
+    
+    // Relativistic Doppler factor (clamped to prevent collapse)
+    Vec4 discVel = {r + a/std::sqrt(r), 
+                   -pos.y * (a >= 0 ? 1 : -1) / std::sqrt(r),
+                   pos.x * (a >= 0 ? 1 : -1) / std::sqrt(r), 
+                   0.0};
+    discVel = discVel * (1.0 / std::sqrt(r*r - 3.0*r + 2.0*a*std::sqrt(r)));
+    double doppler = 1.0 / std::abs(dot4(p, discVel));
+    doppler = std::max(doppler, 0.1);  // Prevent numerical collapse
+    
+    // AGGRESSIVE Doppler boost (approaching side burns WHITE)
+    double dopplerBoost = std::pow(doppler, 8.0);
+    
+    // Vertical falloff (Gaussian-like, strongest at midplane)
+    double verticalFalloff = std::exp(-std::abs(pos.z) / (diskH * 0.3));
+    
+    // Intensity with compression to preserve structure
+    double intensity = 50.0 * temp * density * std::max(dopplerBoost, 0.5) * verticalFalloff;
+    intensity = intensity / (1.0 + intensity);  // Compress extreme values
+    
+    // Physical color: observed temperature folds in radial falloff AND Doppler.
+    // Base runs cool->hot (deep orange outer -> white inner); Doppler^1.5 pushes
+    // the approaching side hotter/blue and the receding side cooler/red.
+    double Tobs = (1600.0 + 5000.0 * temp) * std::pow(doppler, 1.5);
+    Vec3 emissionColor = blackbodyRGB(Tobs) * (0.4 + 0.6 * temp);
+
+    return emissionColor * intensity;
 }
 
 Vec3 mainImage(int px, int py, double iTime) {
     double u = (2.0*px - WIDTH) / (double)WIDTH;
     double v = (2.0*py - HEIGHT) / (double)WIDTH;
     
-    // tilt = std::sin(iTime * 0.5) * 0.5;  // Disabled animation, using fixed tilt
-    
-    double x = std::sqrt(camR*camR + a*a) * std::cos(tilt);
-    double z = camR * std::sin(tilt);
+    double az = iTime * 2.0 * PI;  // iTime is orbit progress in [0,1): one full 360
+    double tl = tilt + tiltAmp * (1.0 - std::cos(az)) * 0.5;  // swoop: edge-on -> up -> edge-on
+
+    double x = std::sqrt(camR*camR + a*a) * std::cos(tl);
+    double z = camR * std::sin(tl);
+
     Vec4 camPos = {0.0, x, 0.0, z};
-    
+
     // Camera aim direction - point towards black hole at origin
     Vec3 toCenter = normalize(Vec3{-x, 0.0, -z});
-    
+
     // Build camera basis
     Vec3 camRight = normalize(Vec3{0.0, 1.0, 0.0});  // y-axis
     Vec3 camUp = normalize(cross(camRight, toCenter));
     camRight = cross(toCenter, camUp);  // Re-orthogonalize
+
+    // Orbit the whole camera rig about the spin axis. Rigid rotation keeps the
+    // spin axis vertical in frame. az=0 is an exact identity -> unchanged stills.
+    if (az != 0.0) {
+        Vec3 cp = rotZ(Vec3{camPos.x, camPos.y, camPos.z}, az);
+        camPos.x = cp.x; camPos.y = cp.y; camPos.z = cp.z;
+        toCenter = rotZ(toCenter, az);
+        camRight = rotZ(camRight, az);
+        camUp = rotZ(camUp, az);
+    }
     
     // Ray direction in camera space
     Vec3 dir = normalize(toCenter * zoom + camRight * u + camUp * v);
     Vec4 dir4D = {-1.0, dir.x, dir.y, dir.z};
     
-    Vec4 pos = camPos;
-    Vec4 p = metric(pos) * dir4D;
+    // Accumulate color from multiple time samples (motion blur)
+    Vec3 accumulatedColor = {0, 0, 0};
     
-    bool captured = false;
-    bool hitDisc = false;
-    double discU = 0, discV = 0;
-    double blueshift = 1.0;
-    
-    for(int i=0; i<maxSteps; i++) {
-        Vec4 lastpos = pos;
-        transportStep(pos, p);
+    for(int timeSample = 0; timeSample < TIME_SAMPLES; timeSample++) {
+        double timeOffset = (timeSample / (double)TIME_SAMPLES) * 2.0 * PI;
         
-        if(pos.z * lastpos.z < 0.0) {
-            Vec4 intersectPos = (pos * std::abs(lastpos.z) + lastpos * std::abs(pos.z)) / 
-                                std::abs(lastpos.z - pos.z);
-            double r = rFromCoords(intersectPos);
-            if(r > discMin && r < discMax) {
-                hitDisc = true;
-                discU = (intersectPos.x / discMax + 1.0) * 0.5;
-                discV = (intersectPos.y / discMax + 1.0) * 0.5;
-                
-                Vec4 discVel = {r + a/std::sqrt(r), 
-                               -intersectPos.y * (a >= 0 ? 1 : -1) / std::sqrt(r),
-                               intersectPos.x * (a >= 0 ? 1 : -1) / std::sqrt(r), 
-                               0.0};
-                discVel = discVel * (1.0 / std::sqrt(r*r - 3.0*r + 2.0*a*std::sqrt(r)));
-                blueshift = 1.0 / dot4(p, discVel);
+        Vec4 pos = camPos;
+        Vec4 p = metric(pos) * dir4D;
+        
+        Vec3 diskLight = {0, 0, 0};
+        bool captured = false;
+        
+        for(int i=0; i<maxSteps; i++) {
+            // Accumulate disk emission along the ray (volumetric)
+            Vec3 emission = diskEmission(pos, p, timeOffset);
+            diskLight += emission * dtau * 15.0;  // Boosted to 15x (compensate for thinner disk)
+            
+            // Check if captured by black hole
+            if(stopCondition(pos)) {
+                double r = rFromCoords(pos);
+                captured = r < 1.0 + std::sqrt(1.0 - a*a);
                 break;
             }
+            
+            transportStep(pos, p);
         }
         
-        if(stopCondition(pos)) {
-            double r = rFromCoords(pos);
-            captured = r < 1.0 + std::sqrt(1.0 - a*a);
-            break;
+        // Add background (nearly invisible) or disk only
+        if(!captured) {
+            // Almost invisible space background
+            Vec4 dir4D_out = inverse(metric(pos)) * p;
+            Vec3 cubeVec = {-dir4D_out.x, dir4D_out.z, -dir4D_out.y};
+            accumulatedColor += skyTexture(cubeVec) * 0.05 + diskLight;  // Sky nearly killed
+        } else {
+            accumulatedColor += diskLight;  // Captured rays only show disk
         }
     }
     
-    if(hitDisc) {
-        Vec3 color = discTexture(discU, discV);
-        return color * std::pow(std::abs(blueshift), 3.0);
-    } else if(!captured) {
-        Vec4 dir4D_out = inverse(metric(pos)) * p;
-        Vec3 cubeVec = {-dir4D_out.x, dir4D_out.z, -dir4D_out.y};
-        return skyTexture(cubeVec);
-    } else {
-        return {0.0, 0.0, 0.0};
-    }
+    // Average over time samples
+    accumulatedColor = accumulatedColor * (1.0 / TIME_SAMPLES);
+    
+    // FILMIC tone mapping (exponential, preserves detail)
+    double exposure = 0.3;
+    Vec3 exposed = accumulatedColor * exposure;
+    
+    // Exponential tone map (better than hard clamp or Reinhard)
+    Vec3 toneMapped = {
+        1.0 - std::exp(-exposed.x),
+        1.0 - std::exp(-exposed.y),
+        1.0 - std::exp(-exposed.z)
+    };
+    
+    // Add halo/glow (cheap bloom effect)
+    double glow = std::fmax(toneMapped.x, std::fmax(toneMapped.y, toneMapped.z));
+    Vec3 halo = toneMapped * (glow * 0.6);
+    toneMapped += halo;
+    
+    // Final clamp
+    return Vec3{
+        std::fmin(toneMapped.x, 1.0),
+        std::fmin(toneMapped.y, 1.0),
+        std::fmin(toneMapped.z, 1.0)
+    };
 }
 
-int main() {
+int main(int argc, char** argv) {
     // Load space background image
     spaceImage = stbi_load("space_background.jpg", &spaceWidth, &spaceHeight, &spaceChannels, 3);
     if (!spaceImage) {
@@ -299,29 +400,53 @@ int main() {
     } else {
         std::cout << "Loaded space background: " << spaceWidth << "x" << spaceHeight << "\n";
     }
-    
-    std::ofstream out("kerr_hamiltonian.ppm", std::ios::binary);
-    out << "P6\n" << WIDTH << " " << HEIGHT << "\n255\n";
-    
-    double iTime = 0.0;
-    
-    for(int y=HEIGHT-1; y>=0; y--) {
-        for(int x=0; x<WIDTH; x++) {
-            Vec3 col = mainImage(x, y, iTime);
-            unsigned char r = (unsigned char)(std::fmin(std::fmax(col.x, 0.0), 1.0) * 255);
-            unsigned char g = (unsigned char)(std::fmin(std::fmax(col.y, 0.0), 1.0) * 255);
-            unsigned char b = (unsigned char)(std::fmin(std::fmax(col.z, 0.0), 1.0) * 255);
-            out << r << g << b;
-        }
+
+    // "orbit [frames]" -> camera fly-around into frames/. No args -> single still.
+    bool orbit = (argc > 1 && std::string(argv[1]) == "orbit");
+    int frames = 1;
+    if (orbit) {
+        TIME_SAMPLES = 1;  // blur is now free across frames, and this is 4x faster
+        frames = (argc > 2) ? std::stoi(argv[2]) : 300;
+        frames = frames > 0 ? frames : 300;
+        std::filesystem::create_directories("frames");
     }
-    
-    out.close();
-    
+
+    std::vector<unsigned char> pixels(WIDTH * HEIGHT * 3);
+
+    for (int f = 0; f < frames; f++) {
+        double iTime = orbit ? (double)f / (double)frames : 0.0;  // [0,1) = one full orbit
+
+        // Pixels are independent and read only shared consts, so the split is exact:
+        // same per-pixel double math in the same order -> bit-identical output to serial.
+        #pragma omp parallel for schedule(dynamic, 4)
+        for(int y=HEIGHT-1; y>=0; y--) {
+            for(int x=0; x<WIDTH; x++) {
+                Vec3 col = mainImage(x, y, iTime);
+                int idx = (y*WIDTH + x) * 3;
+                pixels[idx+0] = (unsigned char)(std::fmin(std::fmax(col.x, 0.0), 1.0) * 255);
+                pixels[idx+1] = (unsigned char)(std::fmin(std::fmax(col.y, 0.0), 1.0) * 255);
+                pixels[idx+2] = (unsigned char)(std::fmin(std::fmax(col.z, 0.0), 1.0) * 255);
+            }
+        }
+
+        char path[64];
+        if (orbit) std::snprintf(path, sizeof(path), "frames/f_%04d.ppm", f);
+        else       std::snprintf(path, sizeof(path), "kerr_hamiltonian.ppm");
+
+        std::ofstream out(path, std::ios::binary);
+        out << "P6\n" << WIDTH << " " << HEIGHT << "\n255\n";
+        out.write((char*)pixels.data(), pixels.size());
+        out.close();
+
+        if (orbit) std::cout << "\rframe " << (f+1) << "/" << frames << std::flush;
+    }
+    if (orbit) std::cout << "\n";
+
     // Free image memory
     if (spaceImage) {
         stbi_image_free(spaceImage);
     }
-    
-    std::cout << "Rendered kerr_hamiltonian.ppm\n";
+
+    std::cout << (orbit ? "Rendered orbit frames to frames/\n" : "Rendered kerr_hamiltonian.ppm\n");
     return 0;
 }
